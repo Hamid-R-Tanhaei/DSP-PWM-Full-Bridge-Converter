@@ -1,0 +1,364 @@
+//#####################################################################
+//  Chip: TMS320F28033
+//  Freq: 60MHz (input osc. freq.:12MHz)
+//  PWM
+//
+//#####################################################################
+#include "DSP28x_Project.h"     // Device Headerfile and Examples Include File
+#include <stdio.h>
+//
+#define TX_En_Mux           GpioCtrlRegs.GPAMUX1.bit.GPIO1
+#define TX_En_Dir           GpioCtrlRegs.GPADIR.bit.GPIO1
+#define TX_En_Clr           GpioDataRegs.GPACLEAR.bit.GPIO1
+#define TX_En_Set           GpioDataRegs.GPASET.bit.GPIO1
+#define TX_En_Dat           GpioDataRegs.GPADAT.bit.GPIO1
+//
+#define TX_Sig_1_Mux        GpioCtrlRegs.GPAMUX1.bit.GPIO2  // EPWM2A
+#define TX_Sig_1_Dir        GpioCtrlRegs.GPADIR.bit.GPIO2
+#define TX_Sig_1_Clr        GpioDataRegs.GPACLEAR.bit.GPIO2
+#define TX_Sig_1_Set        GpioDataRegs.GPASET.bit.GPIO2
+#define TX_Sig_1_Dat        GpioDataRegs.GPADAT.bit.GPIO2
+//
+#define TX_Sig_2_Mux        GpioCtrlRegs.GPAMUX1.bit.GPIO3  // EPWM2B
+#define TX_Sig_2_Dir        GpioCtrlRegs.GPADIR.bit.GPIO3
+#define TX_Sig_2_Clr        GpioDataRegs.GPACLEAR.bit.GPIO3
+#define TX_Sig_2_Set        GpioDataRegs.GPASET.bit.GPIO3
+#define TX_Sig_2_Dat        GpioDataRegs.GPADAT.bit.GPIO3
+//
+#define     TxFreq_Center   517  // (30000/58)
+#define     F60_0  500  // (30000/60)
+////
+#define     short_circuit_threshold 250
+#define     Max_Gap_Critical  400 // Min power Critical (in short cicuit sitiuation)
+#define     Max_Gap  200
+#define     Pwm_Pwr_AGC_Threshold   1400
+#define     FT_60_0  1000 //(60000/60.0)
+//
+void Initialize_Routine(void);
+__interrupt void cpu_timer0_isr(void);
+//__interrupt void xint1_isr(void);
+void Init_GPIOs(void);
+void Init_PWM_Signals(void);
+void Start_Over(void);
+void Flush_Vectors(void);
+void Main_Routine(void);
+void Update_TX_Freq(Uint16 Period, Uint16 Gap);
+void Disable_TX_Signal(void);
+void ADC_TxTune(void);
+void AGC_TX(void);
+void Pwr_Avrager(Uint16 state);
+void Critical_Checks(void);
+void Reset_Device(void);
+//
+Uint16 TX_Freq_Counter = 0;
+Uint16 TX_Pwr = 100;
+Uint16 TX_Freq = TxFreq_Center;
+Uint16 ADC_TxTune_Buffer[4];
+Uint16 TX_Tune_instant;
+Uint16 Tag_Label_mode;
+Uint16 Tune_counter, Tune_offset;
+Uint16 PwmGap = Max_Gap;
+Uint16 Max_Pwm_Gap = Max_Gap;
+Uint16 tune_offset_counter;
+Uint16 TxTune_zero_offset[8];
+Uint32 ADC_DC_Value_pin_1, ADC_DC_Value_pin_2;
+Uint16 AGC_RX_Lagging;
+Uint16 Periodic_init_counter;
+Uint32 Turn_Off_Counter = 0;
+Uint16 RxG_lvls_monitor_1, RxG_lvls_monitor_2, RxG_lvls_monitor_3,
+        RxG_lvls_monitor_4, RxG_lvls_monitor_5, RxG_lvls_monitor_6,
+        RxG_lvls_monitor_7, RxG_lvls_monitor_8, RxG_lvls_monitor_9,
+        RxG_lvls_monitor_10, RxG_lvls_monitor_11;
+Uint16 Test_freq = (60000 / 58);
+Uint16 Ref_freq = (60000 / 70);
+//Uint16 volatile PwmGap = 0;
+#endif
+//=================================//
+void main(void)+
+{
+    Init_GPIOs();
+    //
+    memcpy(&RamfuncsRunStart, &RamfuncsLoadStart, (size_t) &RamfuncsLoadSize);
+    //
+    InitSysCtrl(); // Step 1. Initialize System Control: PLL, WatchDog, enable Peripheral Clocks
+    //
+    DINT;
+    // Disable CPU interrupt
+    //
+    InitFlash();
+    //
+    InitPieCtrl(); // Initialize the PIE control registers to their default state. The default state is all PIE interrupts disabled and flags are cleared.
+    //
+    IER = 0x0000;  // Disable CPU interrupts and clear all CPU interrupt flags:
+    IFR = 0x0000;
+    // Initialize the PIE vector table with pointers to the shell Interrupt
+    // Service Routines (ISR).
+    // This will populate the entire table, even if the interrupt
+    // is not used in this example.  This is useful for debug purposes.
+    // The shell ISR routines are found in DSP2803x_DefaultIsr.c.
+    InitPieVectTable();
+    //
+    // Interrupts that are used in this example are re-mapped to
+    // ISR functions found within this file.
+    //
+    Init_GPIOs();
+    Init_ADC();
+    Initialize_Routine();
+    Init_PWM_Signals();
+    Start_Over();
+    ServiceDog();    // Reset the watchdog counter
+    //
+    EINT;
+    // Enable Global interrupt INTM
+    ERTM;
+    // Enable Global realtime interrupt DBGM
+    //
+    //Wait_in_Error_mode();
+    Main_Routine();
+    for (;;);
+}
+//=================================//
+void Initialize_Routine(void)
+{
+    // Enable Watchdog
+    ServiceDog();    // Reset the watchdog counter
+    EALLOW;
+    SysCtrlRegs.SCSR = 0; //BIT1;
+    SysCtrlRegs.WDCR = 0x002F; // WDCLK = OSCCLK/512/64
+    //
+    DINT;
+    InitCpuTimers();   // For this example, only initialize the Cpu Timers
+    CpuTimer0Regs.TCR.all = 0; // 0x4001; // Use write-only instruction
+    CpuTimer0Regs.TCR.bit.TIE = 0;
+    // External Interrupt: Zero Cross
+    //GpioIntRegs.GPIOXINT1SEL.bit.GPIOSEL = ZC_pin_No;   // XINT1 is ZC
+    // GpioIntRegs.GPIOXINT2SEL.bit.GPIOSEL = Slave_pulse_No;   // XINT2 is Slave-Pulse
+    // Configure XINT1
+    //XIntruptRegs.XINT1CR.bit.POLARITY = 1; // Rising edge (0:Falling edge, 1:Rising edge, 3:both edge)
+    // XIntruptRegs.XINT2CR.bit.POLARITY = 0;      // Falling edge (0:Falling edge, 1:Rising edge, 3:both edge)
+    // Enable XINT1
+    //XIntruptRegs.XINT1CR.bit.ENABLE = 1;        // Enable XINT1
+    //    XIntruptRegs.XINT2CR.bit.ENABLE = 1;        // Enable XINT2
+    // Interrupts that are used in this example are re-mapped to
+    // ISR functions found within this file.
+    //PieVectTable.XINT1 = &xint1_isr;    // Zero-Cross-Pulse
+    //PieVectTable.XINT2 = &xint2_isr;   // Slave-Sync-Pulse
+    PieVectTable.TINT0 = &cpu_timer0_isr;
+    EDIS;
+    // This is needed to disable write to EALLOW protected registers
+    //
+    // Enable XINT1 and XINT2 and TINT0 in the PIE: Group 1 interrupt 4 & 5 &7
+    PieCtrlRegs.PIECTRL.bit.ENPIE = 1;    // Enable the PIE block
+    //PieCtrlRegs.PIEIER1.bit.INTx4 = 1; // XINT1(Zero-Cross-Pulse)      // Enable PIE Group 1 INT4
+    //PieCtrlRegs.PIEIER1.bit.INTx5 = 1;  // XINT2(Slave-Sync-Pulse)      // Enable PIE Group 1 INT5
+    PieCtrlRegs.PIEIER1.bit.INTx7 = 1; // TINT0 (Timer0)   // Enable PIE Group 1 INT7
+    IER |= M_INT1;                        // Enable CPU INT1
+    DINT;
+}
+//============================================//
+void Init_GPIOs(void)
+{
+    // Configure GPIOs:
+    EALLOW;
+    ///////
+    TX_En_Mux = 0;
+    TX_En_Dir = 1;
+    TX_En_Set = 1;
+    //
+    Toggle1_Mux = 0;
+    Toggle1_Dir = 1;
+    Toggle1_Clr = 1;
+    //
+    TX_Sig_1_Mux = 0;
+    TX_Sig_1_Dir = 1;
+    TX_Sig_1_Clr = 1;
+    //
+    TX_Sig_2_Mux = 0;
+    TX_Sig_2_Dir = 1;
+    TX_Sig_2_Clr = 1;
+    //
+    EDIS;
+}
+//==============================================//
+#pragma CODE_SECTION(Init_PWM_Signals, "ramfuncs");
+void Init_PWM_Signals(void)
+{
+    EALLOW;
+    //
+    EPwm2Regs.TBPRD = 517; // Period = * TBCLK counts
+    EPwm2Regs.CMPA.half.CMPA = 317; // Compare A TBCLK counts
+    EPwm2Regs.CMPB = 200; // Compare B TBCLK counts
+    EPwm2Regs.TBPHS.half.TBPHS = 0; // Set Phase register to zero
+    EPwm2Regs.TBPHS.all = 0; // Set Phase register to zero //chng_v1_2
+    EPwm2Regs.TBCTR = 0; // clear TB counter
+    EPwm2Regs.TBCTL.bit.CTRMODE = TB_COUNT_UPDOWN;
+    EPwm2Regs.TBCTL.bit.PHSEN = TB_DISABLE; // Phase loading disabled
+    EPwm2Regs.TBCTL.bit.PRDLD = TB_SHADOW;
+    EPwm2Regs.TBCTL.bit.SYNCOSEL = TB_SYNC_DISABLE;
+    EPwm2Regs.TBCTL.bit.HSPCLKDIV = TB_DIV1; // TBCLK = SYSCLKOUT
+    EPwm2Regs.TBCTL.bit.CLKDIV = TB_DIV1;
+    EPwm2Regs.CMPCTL.bit.SHDWAMODE = CC_SHADOW;
+    EPwm2Regs.CMPCTL.bit.SHDWBMODE = CC_SHADOW;
+    EPwm2Regs.CMPCTL.bit.LOADAMODE = CC_CTR_ZERO; // load on TBCTR = Zero
+    EPwm2Regs.CMPCTL.bit.LOADBMODE = CC_CTR_ZERO; // load on TBCTR = Zero
+    EPwm2Regs.AQCTLA.bit.CAU = AQ_SET;
+    EPwm2Regs.AQCTLA.bit.CAD = AQ_CLEAR;
+    EPwm2Regs.AQCTLB.bit.CBU = AQ_CLEAR;
+    EPwm2Regs.AQCTLB.bit.CBD = AQ_SET;
+    //
+    EDIS;
+}
+void Reset_Device(void)
+{
+    DINT;
+    EALLOW;
+    SysCtrlRegs.WDCR = 0x0047; // a wrong value in order to reset device
+    EDIS;
+}
+//=============================================//
+#pragma CODE_SECTION(cpu_timer0_isr,"ramfuncs");
+__interrupt void cpu_timer0_isr(void)
+{
+    Update_TX_Freq(TX_Freq, TX_Gap);
+    ADC_TxTune();
+    Pwr_Avrager(0);
+    DELAY_US(100);
+    TX_En_Clr = 1;
+    DELAY_US(2000);
+    TX_En_Set = 1;
+    Disable_TX_Signal();
+    DELAY_US(100);
+    ADC_TxTune();
+    Pwr_Avrager(1);
+    AGC_TX();
+    ServiceDog();    // Reset the watchdog counter
+    // stop timer0 , no further count
+    //CpuTimer0Regs.TCR.bit.TIE = 0;
+    //CpuTimer0Regs.TCR.bit.TSS = 1;
+    //
+    CpuTimer0Regs.TCR.bit.TIF = 1;
+    CpuTimer0.InterruptCount++;
+    // Acknowledge this interrupt to receive more interrupts from group 1
+    PieCtrlRegs.PIEACK.all = PIEACK_GROUP1;
+}
+//============================================//
+#pragma CODE_SECTION(Update_TX_Freq, "ramfuncs");
+void Update_TX_Freq(Uint16 Period, Uint16 Gap)
+{
+    if (Gap < 40)
+    {
+        Gap = 200;
+    }
+    if (Period < 500)
+    {
+        Period = 500;
+    }
+    // Period = 30000/PWM_Freq
+    Uint16 CompA, CompB;
+    CompA = Period + Gap;
+    CompA = (CompA >> 1);
+    CompB = Period - Gap;
+    CompB = (CompB >> 1);
+    EALLOW;
+    EPwm2Regs.TBPRD = Period;  // Period = * TBCLK counts
+    EPwm2Regs.CMPA.half.CMPA = CompA; // Compare A TBCLK counts
+    EPwm2Regs.CMPB = CompB; // Compare B TBCLK counts
+    //EPwm2Regs.TBCTR = 0; // clear TB counter
+    TX_Sig_1_Mux = 1;   // Configure as EPWM2A
+    TX_Sig_2_Mux = 1;   // Configure as EPWM2A
+    //
+    EDIS;
+}
+//===============================================//
+#pragma CODE_SECTION(Disable_TX_Signal, "ramfuncs");
+void Disable_TX_Signal(void)
+{
+    EALLOW;
+    TX_Sig_1_Mux = 0;
+    TX_Sig_1_Dir = 1;
+    TX_Sig_1_Clr = 1;
+    TX_Sig_2_Mux = 0;
+    TX_Sig_2_Dir = 1;
+    TX_Sig_2_Clr = 1;
+    EDIS;
+}
+//===============================================//
+#pragma CODE_SECTION(ADC_TxTune, "ramfuncs");
+void ADC_TxTune(void)
+{
+    AdcRegs.ADCINTFLGCLR.bit.ADCINT3 = 1;
+    AdcRegs.ADCSOCFRC1.bit.SOC2 = 1;
+    while (AdcRegs.ADCINTFLG.bit.ADCINT3 == 0){}
+    AdcRegs.ADCINTFLGCLR.bit.ADCINT3 = 1;
+    TX_Tune_instant = AdcResult.ADCRESULT2;
+}
+//===============================================//
+#pragma CODE_SECTION(Pwr_Avrager, "ramfuncs");
+void Pwr_Avrager(Uint 16 state)
+{
+    Uint16 k, temp1;
+    Tune_counter++;
+    if (Tune_counter >= 4)
+    {
+        Tune_counter = 0;
+    }
+    if (state == 0)
+    {
+        TxTune_zero_offset[Tune_counter] = TX_Tune_instant;
+        temp1 = 0;
+        for (k = 0; k < 4; k++)
+        {
+            temp1 += TxTune_zero_offset[k];
+        }
+        temp1 = (temp1 >> 2);
+        Tune_offset = temp1;
+    }
+    else
+    {
+        if (TX_Tune_instant < Tune_offset)
+        {
+            ADC_TxTune_Buffer[Tune_counter] = Tune_offset - TX_Tune_instant;
+        }
+        else
+        {
+            ADC_TxTune_Buffer[Tune_counter] = 0;
+        }
+        for (k = 0; k < 4; k++)
+        {
+            temp1 += ADC_TxTune_Buffer[k];
+        }
+        Tx_Tune_Value = (temp1 >> 2);
+    }
+
+
+}
+//=====================================//
+#pragma CODE_SECTION(AGC_TX, "ramfuncs");
+void AGC_TX(void)
+{
+    Uint16 k, temp1;
+    if (Tx_Tune_Value > Pwm_Pwr_AGC_Threshold)
+    {
+        PwmGap++;
+    }
+    else
+    {
+        PwmGap--;
+    }
+    if (PwmGap > Max_Gap)
+    {
+        PwmGap = Max_Gap; // Min Gain
+    }
+    if (PwmGap < TX_Pwr)
+    {
+        PwmGap = TX_Pwr;    // Max Gain
+    }
+    if (TX_Tune_instant < short_circuit_threshold)   // short-circuit condition
+    {
+        PwmGap = Max_Gap_Critical;
+        Reset_Device();
+    }
+}
+//============================================//
+
+
